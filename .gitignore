@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# 数据文件（可由数据管道重新生成/下载）
+data/hkstore/*.h5
+data/hkstore/*.db
+data/logs/
+data/state/
+data/cache/
+data/storage/cache/
+
+# 运行状态与产物
+state/
+*.log
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# 环境与密钥
+.env
+.env.*
