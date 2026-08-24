@@ -44,12 +44,57 @@
 │     neutralize.py    行业/因子中性化         │
 │     calendar.py      交易日历                │
 ├─────────────────────────────────────────────┤
+│  datacenter/         数据基座（hikyuu 整合）  │
+│  ├── import_full.py  全量导入→HDF5           │
+│  ├── daily_update.py 每日增量更新            │
+│  ├── repair_gaps.py  缺口回补                │
+│  ├── scheduler.py    定时任务调度            │
+│  ├── verify.py       数据完整性校验          │
+│  ├── analyze_stock.py hikyuu 技术分析        │
+│  └── mysql_db.py     MySQL 业务库(信号落库)  │
+├─────────────────────────────────────────────┤
+│  predict/            Kronos 预测引擎（整合）  │
+│  ├── kronos_engine.py 模型封装+H5直读+采样   │
+│  └── run_predict.py   预测 CLI 入口          │
+├─────────────────────────────────────────────┤
 │  pipeline.py         主流程（端到端流水线）   │
 │  run_factor.py       单因子检验入口          │
 │  run_backtest.py     多因子回测入口          │
 │  run_signals.py      每日信号生成入口        │
 └─────────────────────────────────────────────┘
 ```
+
+## 组件整合说明
+
+本系统按"逻辑整合"方式嵌入两个外部组件，均保留独立上游仓库（vendor 引用，便于升级）：
+
+| 组件 | 上游仓库 | 整合方式 | 数据流 |
+|:----|:----|:----|:----|
+| **hikyuu** | `../hikyuu`（pip 包 `hikyuu 2.8.2` + `hikyuu.data` 源码引用） | K 线主存储 HDF5（`data/hkstore/*_day.h5`）、代码表 SQLite（`stock.db`）；datacenter 负责导入/更新/校验 | 通达信 → HDF5 → `analyze_stock`/`predict` 消费 |
+| **Kronos** | `../Kronos`（`KRONOS_HOME` 环境变量可覆盖） | `predict/` 模块通过 vendor 路径引用 Kronos 模型代码，权重从 HuggingFace 加载（缓存全局共享） | HDF5 直读 → GPU 采样预测 → `state/predicts/` + MySQL `kronos_signal` |
+
+### 预测引擎用法
+
+```bash
+# 个股未来半年走势预测（默认 6 个月 / 20 条采样 / GPU）
+python -m predict.run_predict 600900
+python -m predict.run_predict 长江电力 --months 6 --samples 20 --chart
+
+# 结果写入 MySQL kronos_signal 表
+python -m predict.run_predict 600900 --save-mysql
+
+# 输出位置：state/predicts/pred_{code}_summary.csv + *_chart.png
+```
+
+### 环境约定（重要）
+
+- 所有依赖统一装在 `quant/.venv`（含 hikyuu 与 torch，已验证共存）。
+- **hikyuu 的 C++ 扩展必须先于 numpy/torch 导入**，否则触发 glibc TLS 崩溃；
+  运行 hikyuu 相关脚本（如 `analyze_stock.sh`）需 `LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1`。
+- `predict/` 模块刻意不 import hikyuu（股票定位用 sqlite3 直查 `stock.db`），
+  因此预测进程无需 LD_PRELOAD，与 hikyuu 进程相互独立。
+- 模型下载走 HuggingFace，可设 `HF_ENDPOINT=https://hf-mirror.com` 加速；
+  国内网络需 socks 代理时安装 `socksio`。
 
 ## 快速开始
 

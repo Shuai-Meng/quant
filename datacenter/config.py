@@ -64,3 +64,19 @@ MYSQL_CONFIG = {
     "autocommit": False,
     "use_pure": True,
 }
+
+# ===== Kronos 预测（逻辑整合，vendor 引用外部 Kronos 仓库）=====
+# Kronos 模型代码所在仓库根目录，可用环境变量 KRONOS_HOME 覆盖
+KRONOS_HOME = Path(os.getenv("KRONOS_HOME", str(QUANT_ROOT.parent / "Kronos")))
+# 预训练模型（HuggingFace，缓存在 ~/.cache/huggingface，全局共享）
+KRONOS_MODEL = os.getenv("KRONOS_MODEL", "NeoQuasar/Kronos-base")
+KRONOS_TOKENIZER = os.getenv("KRONOS_TOKENIZER", "NeoQuasar/Kronos-Tokenizer-base")
+# 默认预测参数
+KRONOS_DEFAULT = {
+    "lookback": 400,   # 历史回望窗口（交易日）
+    "pred_len": 120,   # 默认预测长度（约半年）
+    "n_samples": 20,   # 采样轨迹数（概率区间用）
+    "T": 1.0,          # 采样温度
+    "top_p": 0.9,      # 核采样
+    "device": "cuda:0",
+}

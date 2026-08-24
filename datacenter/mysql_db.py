@@ -160,6 +160,47 @@ def log_import(kind: str, market: str, added_records: int = 0, failed: int = 0,
         logger.warning("写入 import_log 失败（已降级，不影响导入）: %s", e)
 
 
+def save_kronos_signal(stock_code: str, trade_date, signal_type: str,
+                       probability=None, features_json=None,
+                       model_version=None) -> None:
+    """写入/更新一条 Kronos 预测信号（kronos_signal 表，UPSERT）。
+
+    - stock_code: 证券代码，如 sh600900
+    - trade_date: 交易日（date/str/None 均可）
+    - signal_type: up/down/flat
+    - probability: 预测概率(0~1)
+    - features_json: dict 或 None（预测序列快照，自动 JSON 序列化）
+    MySQL 不可用时静默降级，不阻塞预测流程。
+    """
+    try:
+        import json
+        if trade_date is not None and not isinstance(trade_date, str):
+            trade_date = trade_date.isoformat()
+        conn = get_connection(autocommit=True)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO kronos_signal"
+                " (stock_code, trade_date, signal_type, probability, features_json, model_version)"
+                " VALUES (%s, %s, %s, %s, %s, %s)"
+                " ON DUPLICATE KEY UPDATE"
+                " signal_type=VALUES(signal_type), probability=VALUES(probability),"
+                " features_json=VALUES(features_json), model_version=VALUES(model_version)",
+                (
+                    stock_code,
+                    trade_date,
+                    signal_type,
+                    float(probability) if probability is not None else None,
+                    json.dumps(features_json, ensure_ascii=False) if features_json else None,
+                    model_version,
+                ),
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("写入 kronos_signal 失败（已降级，不影响预测）: %s", e)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MySQL 业务库初始化")
     parser.add_argument("--init", action="store_true", help="初始化数据库与业务表")

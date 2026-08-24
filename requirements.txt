@@ -1,8 +1,24 @@
+# ===== 核心计算 =====
 pandas>=1.5.0
 numpy>=1.23.0
 statsmodels>=0.14.0
 scipy>=1.10.0
 matplotlib>=3.6.0
+pyarrow>=10.0.0
+
+# ===== 数据获取 =====
 akshare>=1.10.0
 requests>=2.28.0
-pyarrow>=10.0.0
+
+# ===== HDF5 存储（hikyuu 数据基座）=====
+tables>=3.9.0
+
+# ===== MySQL 业务库 =====
+mysql-connector-python>=8.3.0
+
+# ===== Kronos 预测引擎（逻辑整合模块 quant/predict）=====
+torch>=2.4.0
+einops>=0.8.0
+huggingface_hub>=0.24.0
+safetensors>=0.4.0
+socksio>=1.0.0
