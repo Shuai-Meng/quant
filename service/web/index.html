@@ -55,6 +55,9 @@ tr:hover { background:rgba(255,255,255,.02); }
 .flex { display:flex; align-items:center; gap:8px; }
 .spin { animation:spin 1s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
+.kpi-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
+.kpi-label { font-size:11px; color:var(--muted); margin-bottom:4px; }
+.kpi-value { font-size:18px; font-weight:600; }
 .empty { text-align:center; color:var(--muted); padding:40px; }
 .tag { display:inline-block; background:var(--border); color:var(--text); padding:2px 6px; border-radius:3px; font-size:11px; margin:1px; }
 #log-panel { max-height:300px; overflow-y:auto; font-family:monospace; font-size:12px; }
@@ -79,6 +82,7 @@ tr:hover { background:rgba(255,255,255,.02); }
   <button onclick="showTab('signals')">交易信号</button>
   <button onclick="showTab('hotstocks')">热点股票</button>
   <button onclick="showTab('backtest')">回测</button>
+  <button onclick="showTab('predict')">AI 预测</button>
 </div>
 
 <div class="main">
@@ -244,8 +248,57 @@ tr:hover { background:rgba(255,255,255,.02); }
   </div>
 </div>
 
+<!-- ==================== AI 预测 ==================== -->
+<div id="tab-predict" class="tab-content">
+  <div class="card" style="margin-bottom:16px">
+    <h3>Kronos AI 预测</h3>
+    <div class="form-row">
+      <div><label>股票代码/名称</label><input id="pd-query" placeholder="如 600900 / 长江电力" style="width:170px"></div>
+      <div><label>预测月数</label><input id="pd-months" type="number" value="6" min="1" max="24" style="width:80px"></div>
+      <div><label>采样轨迹数</label><input id="pd-samples" type="number" value="20" min="5" max="100" style="width:80px"></div>
+      <div><label>回望天数</label><input id="pd-lookback" type="number" value="400" min="100" max="2000" style="width:90px"></div>
+      <div style="padding-bottom:6px"><label style="margin:0;color:var(--text)"><input type="checkbox" id="pd-save-mysql" checked> 写入信号库</label></div>
+      <button class="btn" onclick="runPrediction()">🚀 开始预测</button>
+    </div>
+    <div id="pd-status" style="font-size:13px;color:var(--muted)"></div>
+  </div>
+
+  <div class="flex" style="justify-content:space-between;flex-wrap:wrap;margin-bottom:8px">
+    <div class="section-title" style="margin:0">已有预测</div>
+    <div class="flex" style="gap:8px">
+      <span id="pd-count" style="font-size:12px;color:var(--muted)"></span>
+      <button class="btn btn-sm btn-outline" onclick="loadPredicts()">刷新</button>
+    </div>
+  </div>
+  <table id="predicts-table"><thead><tr>
+    <th>代码</th><th>名称</th><th>信号</th><th>概率</th><th>最新收盘</th><th>期末P50</th><th>涨跌</th><th>预测区间</th><th>预测期</th><th>生成时间</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+  <div id="predicts-empty" class="empty">暂无预测，输入股票代码开始生成</div>
+
+  <!-- 预测详情 -->
+  <div id="pd-detail" style="display:none;margin-top:20px">
+    <div class="section-title" id="pd-detail-title"></div>
+    <div class="grid" id="pd-kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))"></div>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:12px">
+      <div id="pd-chart" style="height:420px"></div>
+    </div>
+    <div id="pd-horizon" style="margin-top:16px"></div>
+  </div>
+
+  <div class="section-title" style="margin-top:28px">预测信号历史（MySQL）</div>
+  <div class="flex" style="gap:8px;margin-bottom:8px">
+    <button class="btn btn-sm btn-outline" onclick="loadPredictSignals()">刷新</button>
+    <span id="pd-signals-state" style="font-size:12px;color:var(--muted)"></span>
+  </div>
+  <table id="signals-hist-table"><thead><tr>
+    <th>代码</th><th>交易日</th><th>信号</th><th>概率</th><th>期末P50</th><th>区间</th><th>模型</th><th>生成时间</th>
+  </tr></thead><tbody></tbody></table>
+  <div id="signals-hist-empty" class="empty">暂无历史信号</div>
 </div>
 
+</div>
+
+<script src="/static/js/echarts.min.js"></script>
 <script>
 const API = '';
 let autoRefresh = null;
@@ -260,6 +313,7 @@ function showTab(name) {
   if (name === 'signals') loadSignals();
   if (name === 'hotstocks') loadHotStocks();
   if (name === 'backtest') { initBacktestForm(); loadBacktestResults(); }
+  if (name === 'predict') { loadPredicts(); loadPredictSignals(); }
 }
 
 // ---- Clock ----
@@ -785,6 +839,225 @@ async function toggleStrategy(id) {
 async function runStrategy(id) {
   const r = await api('/api/strategies/run', 'POST', {id});
   if (r) alert(`策略 "${id}" 回测已提交，结果输出到终端`);
+}
+
+// ---- AI 预测 ----
+let pdChart = null;
+
+async function loadPredicts() {
+  const data = await api('/api/predicts');
+  const tbody = document.querySelector('#predicts-table tbody');
+  const empty = document.getElementById('predicts-empty');
+  document.getElementById('pd-count').textContent = data && data.count != null ? `共 ${data.count} 条` : '';
+  if (!data || !data.predicts || !data.predicts.length) {
+    empty.style.display = 'block';
+    document.querySelector('#predicts-table').style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  document.querySelector('#predicts-table').style.display = '';
+  tbody.innerHTML = data.predicts.map(p => {
+    const up = p.direction === 'up';
+    const badge = `<span class="badge" style="background:${up ? 'var(--red)' : 'var(--green)'}">${up ? '看多 ↑' : '看空 ↓'}</span>`;
+    const prob = p.prob != null ? (p.prob * 100).toFixed(1) + '%' : '--';
+    const chgCls = p.final_chg >= 0 ? 'up' : 'down';
+    return `<tr>
+      <td>${p.code}</td>
+      <td>${p.name || '--'}</td>
+      <td>${badge}</td>
+      <td>${prob}</td>
+      <td>${p.last_close}</td>
+      <td>${p.final_p50}</td>
+      <td class="${chgCls}">${p.final_chg >= 0 ? '+' : ''}${p.final_chg}%</td>
+      <td>${p.lo_p10} ~ ${p.hi_p90}</td>
+      <td>${p.start_date} ~ ${p.end_date}<br><small style="color:var(--muted)">${p.pred_len} 个交易日</small></td>
+      <td>${p.file_time}</td>
+      <td>
+        <button class="btn btn-sm" onclick="showPredictDetail('${p.code}')">📊 查看</button>
+        <button class="btn btn-sm btn-outline" onclick="deletePredict('${p.code}')" style="color:var(--red)">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function runPrediction() {
+  const status = document.getElementById('pd-status');
+  const query = document.getElementById('pd-query').value.trim();
+  if (!query) { status.textContent = '请输入股票代码或名称'; return; }
+  const payload = {
+    query,
+    months: +document.getElementById('pd-months').value || 6,
+    samples: +document.getElementById('pd-samples').value || 20,
+    lookback: +document.getElementById('pd-lookback').value || 400,
+    save_mysql: document.getElementById('pd-save-mysql').checked,
+    chart: true,
+  };
+  status.style.color = 'var(--muted)';
+  status.textContent = `⏳ 正在预测 ${query} … 首次运行需加载/下载模型，可能耗时数分钟`;
+  try {
+    const r = await api('/api/predicts/run', 'POST', payload);
+    if (r && r.success) {
+      const p = r.predict;
+      status.textContent = `✅ ${p.code} ${p.name}：${p.direction === 'up' ? '看多' : '看空'}，期末 P50 ${p.final_p50}（${p.final_chg >= 0 ? '+' : ''}${p.final_chg}%）${p.mysql ? '，已写入信号库' : ''}`;
+      await loadPredicts();
+      await loadPredictSignals();
+      await showPredictDetail(p.code);
+    } else if (r && r.detail) {
+      status.style.color = 'var(--red)';
+      status.textContent = '❌ ' + (typeof r.detail === 'string' ? r.detail : JSON.stringify(r.detail));
+    } else {
+      status.textContent = '❌ 预测失败，请查看后端日志';
+    }
+  } catch (e) {
+    status.style.color = 'var(--red)';
+    status.textContent = '❌ 预测失败: ' + (e.message || e);
+  }
+}
+
+async function showPredictDetail(code) {
+  const data = await api('/api/predicts/' + code);
+  if (!data) return;
+  document.getElementById('pd-detail').style.display = 'block';
+  const up = data.direction === 'up';
+  document.getElementById('pd-detail-title').textContent =
+    `📊 ${data.name || ''} ${data.code} · Kronos 预测（${data.start_date} ~ ${data.end_date}，${data.pred_len} 个交易日）`;
+  const chgCls = data.final_chg >= 0 ? 'up' : 'down';
+  const kpi = (label, value, cls = '') =>
+    `<div class="kpi-card"><div class="kpi-label">${label}</div><div class="kpi-value ${cls}">${value}</div></div>`;
+  document.getElementById('pd-kpis').innerHTML =
+    kpi('最新收盘', data.last_close) +
+    kpi('期末 P50', data.final_p50) +
+    kpi('期末涨跌', `${data.final_chg >= 0 ? '+' : ''}${data.final_chg}%`, chgCls) +
+    kpi('信号方向', up ? '看多 ↑' : '看空 ↓', up ? 'up' : 'down') +
+    kpi('看多概率', data.prob != null ? (data.prob * 100).toFixed(1) + '%' : '--') +
+    kpi('P10~P90 区间', `${data.lo_p10} ~ ${data.hi_p90}`);
+  renderPredictChart(data);
+  renderHorizon(data);
+}
+
+function renderPredictChart(data) {
+  const el = document.getElementById('pd-chart');
+  const histDates = (data.history || []).map(h => h.date);
+  const histClose = (data.history || []).map(h => h.close);
+  const pred = data.prediction || [];
+  const predDates = pred.map(p => p.date);
+  const p10 = pred.map(p => p.p10), p25 = pred.map(p => p.p25),
+        p50 = pred.map(p => p.p50), p75 = pred.map(p => p.p75), p90 = pred.map(p => p.p90);
+  const allDates = histDates.concat(predDates);
+  const span = (lo, hi) => lo.map((v, i) => (hi[i] - v).toFixed(3));
+  if (pdChart) pdChart.dispose();
+  pdChart = echarts.init(el, 'dark');
+  pdChart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(15,15,30,0.9)', borderColor: '#333', textStyle: { color: '#ccc' },
+      formatter: function(params) {
+        const date = params[0] ? params[0].axisValue : '';
+        let html = `<b>${date}</b>`;
+        params.forEach(p => {
+          if (p.seriesName === 'P10~P90' || p.seriesName === 'P25~P75' || p.seriesName === '') return;
+          html += `<br>${p.marker} ${p.seriesName}: ${p.value != null ? p.value : '--'}`;
+        });
+        return html;
+      }
+    },
+    legend: { data: ['历史收盘', 'P50', 'P25~P75', 'P10~P90'], textStyle: { color: '#888' }, top: 0, right: 10 },
+    grid: { left: 60, right: 20, top: 36, bottom: 60 },
+    xAxis: {
+      type: 'category', data: allDates, boundaryGap: false,
+      axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' }
+    },
+    yAxis: {
+      type: 'value', scale: true,
+      axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' },
+      splitLine: { lineStyle: { color: '#1c1c28' } }
+    },
+    dataZoom: [
+      { type: 'inside', start: 0, end: 100 },
+      { type: 'slider', height: 16, bottom: 8, borderColor: '#333', backgroundColor: '#141420',
+        fillerColor: 'rgba(99,102,241,0.25)', textStyle: { color: '#666' } }
+    ],
+    series: [
+      { name: 'P10~P90', type: 'line', data: p10, stack: 'b90', symbol: 'none',
+        lineStyle: { opacity: 0 }, areaStyle: { color: '#ef4444', opacity: 0.10 }, silent: true, tooltip: { show: false } },
+      { name: 'P10~P90', type: 'line', data: span(p10, p90), stack: 'b90', symbol: 'none',
+        lineStyle: { opacity: 0 }, areaStyle: { color: '#ef4444', opacity: 0.10 }, silent: true, tooltip: { show: false } },
+      { name: 'P25~P75', type: 'line', data: p25, stack: 'b75', symbol: 'none',
+        lineStyle: { opacity: 0 }, areaStyle: { color: '#f97316', opacity: 0.16 }, silent: true, tooltip: { show: false } },
+      { name: 'P25~P75', type: 'line', data: span(p25, p75), stack: 'b75', symbol: 'none',
+        lineStyle: { opacity: 0 }, areaStyle: { color: '#f97316', opacity: 0.16 }, silent: true, tooltip: { show: false } },
+      { name: '历史收盘', type: 'line', data: histClose, symbol: 'none',
+        lineStyle: { width: 1.4, color: '#60a5fa' }, z: 2 },
+      { name: 'P50', type: 'line', data: p50, symbol: 'none',
+        lineStyle: { width: 2, color: '#ef4444', type: 'dashed' }, z: 3 }
+    ]
+  });
+  if (allDates.length > 260) {
+    pdChart.dispatchAction({ type: 'dataZoom', startValue: allDates[allDates.length - 260], endValue: allDates[allDates.length - 1] });
+  }
+}
+
+function renderHorizon(data) {
+  const pred = data.prediction || [];
+  if (!pred.length) return;
+  const idx = [0, Math.floor(pred.length * 0.25), Math.floor(pred.length * 0.5), pred.length - 1];
+  const labels = ['起 点', '1/4 程', '半 程', '期末'];
+  const rows = idx.map((i, n) => {
+    const p = pred[i];
+    const chg = (p.p50 / data.last_close - 1) * 100;
+    const cls = chg >= 0 ? 'up' : 'down';
+    return `<tr>
+      <td>${labels[n]}</td><td>${p.date}</td><td>${p.p10}</td><td>${p.p50}</td><td>${p.p90}</td>
+      <td class="${cls}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('pd-horizon').innerHTML =
+    `<table><thead><tr><th>时点</th><th>日期</th><th>P10</th><th>P50</th><th>P90</th><th>较最新收盘</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function deletePredict(code) {
+  if (!confirm(`确定删除 ${code} 的预测产物（CSV/图表）？`)) return;
+  const r = await api('/api/predicts/' + code, 'DELETE');
+  if (r && r.success) await loadPredicts();
+}
+
+async function loadPredictSignals() {
+  const data = await api('/api/predicts/signals');
+  const tbody = document.querySelector('#signals-hist-table tbody');
+  const empty = document.getElementById('signals-hist-empty');
+  const state = document.getElementById('pd-signals-state');
+  const table = document.querySelector('#signals-hist-table');
+  if (!data || !data.available) {
+    state.textContent = 'MySQL 不可用';
+    empty.style.display = 'block';
+    empty.textContent = 'MySQL 未配置或连接失败，无法读取历史信号';
+    table.style.display = 'none';
+    return;
+  }
+  state.textContent = `共 ${data.count} 条`;
+  if (!data.signals || !data.signals.length) {
+    empty.style.display = 'block';
+    empty.textContent = '暂无历史信号';
+    table.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  table.style.display = '';
+  tbody.innerHTML = data.signals.map(s => {
+    const up = s.signal_type === 'up';
+    const f = s.features || {};
+    return `<tr>
+      <td>${s.stock_code}</td>
+      <td>${s.trade_date}</td>
+      <td><span class="badge" style="background:${up ? 'var(--red)' : 'var(--green)'}">${up ? '看多 ↑' : '看空 ↓'}</span></td>
+      <td>${s.probability != null ? (s.probability * 100).toFixed(1) + '%' : '--'}</td>
+      <td>${f.final_p50 != null ? f.final_p50 : '--'}</td>
+      <td>${f.lo_p10 != null ? `${f.lo_p10} ~ ${f.hi_p90}` : '--'}</td>
+      <td style="font-size:12px">${s.model_version || '--'}</td>
+      <td>${s.created_at || '--'}</td>
+    </tr>`;
+  }).join('');
 }
 
 // ---- Utils ----

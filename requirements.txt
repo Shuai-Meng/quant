@@ -22,3 +22,7 @@ einops>=0.8.0
 huggingface_hub>=0.24.0
 safetensors>=0.4.0
 socksio>=1.0.0
+
+# ===== Web 服务（FastAPI 前端）=====
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

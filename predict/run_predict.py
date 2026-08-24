@@ -111,6 +111,85 @@ def render_summary(market_code: str, name: str, summary: pd.DataFrame,
     print(f"  期末中位涨跌: {final_chg:+.1f}%")
 
 
+def run_prediction(query: str, months: int = 6, samples: int = 20,
+                   lookback: int = 400, device: str = "cuda:0",
+                   chart: bool = False, save_mysql: bool = False,
+                   model: str | None = None, verbose: bool = True) -> dict:
+    """执行一次 Kronos 预测（CLI 与 API 共用）。
+
+    返回摘要 dict：
+        code/name/start_date/end_date/pred_len/last_close/final_p50/final_chg/
+        direction/prob/hi_p90/lo_p10/model/csv/chart/mysql
+    未找到股票时抛 ValueError。
+    """
+    found = find_stock(query)
+    if not found:
+        raise ValueError(f"未在 stock.db 中找到: {query}")
+    market_code, name, _ = found
+    pred_len = max(1, months * 21)
+
+    engine = KronosEngine.get(device=device, model_name=model)
+    if verbose:
+        print(f"加载模型 {engine.model_name} …", flush=True)
+    summary, _, last_close, hist = engine.predict(
+        market_code, pred_len=pred_len, lookback=lookback, n_samples=samples,
+    )
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = OUT_DIR / f"pred_{market_code.lower()}_summary.csv"
+    summary.to_csv(csv_path, index=False)
+
+    if verbose:
+        render_summary(market_code, name, summary, last_close)
+        print(f"\nCSV 已保存: {csv_path}")
+
+    result = {
+        "code": market_code.lower(),
+        "name": name,
+        "start_date": str(pd.to_datetime(summary["date"].iloc[0]).date()),
+        "end_date": str(pd.to_datetime(summary["date"].iloc[-1]).date()),
+        "pred_len": int(len(summary)),
+        "last_close": round(float(last_close), 3),
+        "final_p50": round(float(summary["close_p50"].iloc[-1]), 3),
+        "final_chg": round((float(summary["close_p50"].iloc[-1]) / float(last_close) - 1) * 100, 2),
+        "direction": "up" if summary["close_p50"].iloc[-1] > last_close else "down",
+        "hi_p90": round(float(summary["close_p90"].max()), 3),
+        "lo_p10": round(float(summary["close_p10"].min()), 3),
+        "model": str(engine.model_name),
+        "csv": str(csv_path),
+        "chart": None,
+        "mysql": False,
+    }
+    # 概率近似：P50 预测序列高于最新收盘的交易日占比（0~1）
+    prob = float(np.mean(summary["close_p50"].values > last_close))
+    result["prob"] = round(prob, 4) if 0.0 < prob < 1.0 else None
+
+    if chart:
+        png = build_chart(market_code, name, summary, hist)
+        result["chart"] = str(png)
+        if verbose:
+            print(f"图表已保存: {png}")
+
+    if save_mysql:
+        features = build_features_json(market_code, summary, result["model"])
+        trade_date = pd.to_datetime(hist["date"].iloc[-1]).date()
+        from datacenter.mysql_db import save_kronos_signal
+        save_kronos_signal(
+            stock_code=market_code.lower(),
+            trade_date=trade_date,
+            signal_type=result["direction"],
+            probability=result["prob"],
+            features_json=features,
+            model_version=result["model"],
+        )
+        result["mysql"] = True
+        if verbose:
+            print(f"已写入 MySQL kronos_signal: {market_code.lower()} @ {trade_date} "
+                  f"({result['direction']})")
+
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Kronos 个股价格走势预测")
     parser.add_argument("query", help="股票代码（600900/SH600900）或名称（长江电力）")
@@ -128,48 +207,19 @@ def main() -> None:
     parser.add_argument("--model", default=None, help="覆盖 Kronos 模型名（默认取配置）")
     args = parser.parse_args()
 
-    found = find_stock(args.query)
-    if not found:
-        print(f"未在 stock.db 中找到: {args.query}", file=sys.stderr)
-        raise SystemExit(1)
-    market_code, name, _ = found
-    pred_len = max(1, args.months * 21)
-
-    engine = KronosEngine.get(device=args.device, model_name=args.model)
-    print(f"加载模型 {engine.model_name} …", flush=True)
-    summary, _, last_close, hist = engine.predict(
-        market_code, pred_len=pred_len, lookback=args.lookback, n_samples=args.samples,
-    )
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = OUT_DIR / f"pred_{market_code.lower()}_summary.csv"
-    summary.to_csv(csv_path, index=False)
-    render_summary(market_code, name, summary, last_close)
-    print(f"\nCSV 已保存: {csv_path}")
-
-    if args.chart:
-        png = build_chart(market_code, name, summary, hist)
-        print(f"图表已保存: {png}")
-
-    if args.save_mysql:
-        model_version = f"{engine.model_name}"
-        features = build_features_json(market_code, summary, model_version)
-        direction = "up" if summary["close_p50"].iloc[-1] > last_close else "down"
-        # 概率近似：P50 预测序列高于最新收盘的交易日占比（0~1）
-        prob = float(np.mean(summary["close_p50"].values > last_close))
-        if not 0.0 < prob < 1.0:
-            prob = None
-        trade_date = pd.to_datetime(hist["date"].iloc[-1]).date()
-        from datacenter.mysql_db import save_kronos_signal
-        save_kronos_signal(
-            stock_code=market_code.lower(),
-            trade_date=trade_date,
-            signal_type=direction,
-            probability=prob,
-            features_json=features,
-            model_version=model_version,
+    try:
+        result = run_prediction(
+            args.query, months=args.months, samples=args.samples,
+            lookback=args.lookback, device=args.device,
+            chart=args.chart, save_mysql=args.save_mysql, model=args.model,
         )
-        print(f"已写入 MySQL kronos_signal: {market_code.lower()} @ {trade_date} ({direction})")
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1)
+    print("=" * 62)
+    print(f"期末中位价 P50: {result['final_p50']}  "
+          f"涨跌 {result['final_chg']:+.2f}%  方向 {result['direction']}  "
+          f"区间 {result['lo_p10']}~{result['hi_p90']}")
 
 
 if __name__ == "__main__":

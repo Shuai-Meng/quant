@@ -29,6 +29,10 @@ app = FastAPI(title="Quant Service API", version="0.1.0")
 # 静态文件服务 (web界面)
 _WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
+# state 目录（预测图表 PNG 等产物）
+_STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
+if os.path.isdir(_STATE_DIR):
+    app.mount("/state", StaticFiles(directory=_STATE_DIR), name="state")
 
 
 @app.get("/")
@@ -554,3 +558,191 @@ async def api_strategy_types():
         return {"types": types, "categories": ["ETF", "股票", "混合", "基准"]}
     except Exception:
         return {"types": [], "categories": []}
+
+
+# ============================================================
+# Kronos AI 预测
+# ============================================================
+_PREDICT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "state", "predicts",
+)
+# 同一时间只允许一个预测任务（模型加载 + GPU 推理串行化）
+_predict_lock = threading.Lock()
+
+
+def _predict_summary_from_csv(csv_path: str) -> dict | None:
+    """从预测 CSV 构建列表项摘要（不读 H5，保证扫描够快）。"""
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            return None
+        first, last = df.iloc[0], df.iloc[-1]
+        market_code = os.path.basename(csv_path).replace("pred_", "").replace("_summary.csv", "")
+        last_close = float(first["close_p50"])  # 预测首日中位数 ≈ 最新收盘
+        final_p50 = float(last["close_p50"])
+        prob = float(((df["close_p50"] > last_close).mean()))
+        return {
+            "code": market_code,
+            "name": "",
+            "start_date": str(pd.to_datetime(first["date"]).date()),
+            "end_date": str(pd.to_datetime(last["date"]).date()),
+            "pred_len": int(len(df)),
+            "last_close": round(last_close, 3),
+            "final_p50": round(final_p50, 3),
+            "final_chg": round((final_p50 / last_close - 1) * 100, 2),
+            "direction": "up" if final_p50 > last_close else "down",
+            "prob": round(prob, 4) if 0.0 < prob < 1.0 else None,
+            "hi_p90": round(float(df["close_p90"].max()), 3),
+            "lo_p10": round(float(df["close_p10"].min()), 3),
+            "file_time": datetime.fromtimestamp(os.path.getmtime(csv_path)).strftime("%Y-%m-%d %H:%M"),
+            "has_chart": os.path.exists(csv_path.replace("_summary.csv", "_chart.png")),
+        }
+    except Exception:
+        return None
+
+
+def _predict_paths(market_code: str) -> tuple[str, str]:
+    """返回 (csv_path, chart_path)，market_code 如 sh600900。"""
+    mc = market_code.lower()
+    csv_path = os.path.join(_PREDICT_DIR, f"pred_{mc}_summary.csv")
+    chart_path = os.path.join(_PREDICT_DIR, f"pred_{mc}_chart.png")
+    return csv_path, chart_path
+
+
+@app.get("/api/predicts")
+async def api_predicts():
+    """已生成的 AI 预测列表（扫描 state/predicts）"""
+    if not os.path.isdir(_PREDICT_DIR):
+        return {"predicts": [], "count": 0}
+    predicts = []
+    for fname in sorted(os.listdir(_PREDICT_DIR)):
+        if fname.endswith("_summary.csv"):
+            item = _predict_summary_from_csv(os.path.join(_PREDICT_DIR, fname))
+            if item:
+                try:
+                    from predict.kronos_engine import find_stock
+                    found = find_stock(item["code"])
+                    item["name"] = found[1] if found else ""
+                except Exception:
+                    pass
+                predicts.append(item)
+    predicts.sort(key=lambda x: x["file_time"], reverse=True)
+    return {"predicts": predicts, "count": len(predicts)}
+
+
+@app.get("/api/predicts/signals")
+async def api_predict_signals(limit: int = Query(50, ge=1, le=500)):
+    """Kronos 预测信号历史（MySQL kronos_signal 表，可用性自动探测）"""
+    try:
+        from datacenter.mysql_db import list_kronos_signals, ping
+        rows = list_kronos_signals(limit=limit)
+        return {"available": True, "signals": rows, "count": len(rows)}
+    except Exception as e:
+        return {"available": False, "signals": [], "count": 0, "error": str(e)}
+
+
+@app.get("/api/predicts/{code}")
+async def api_predict_detail(code: str):
+    """单个预测详情：历史收盘 + 未来 P10~P90 全序列（供 echarts 绘图）"""
+    csv_path, _ = _predict_paths(code)
+    if not os.path.exists(csv_path):
+        raise HTTPException(404, f"预测不存在: {code}（先通过 POST /api/predicts/run 生成）")
+
+    import pandas as pd
+    summary = pd.read_csv(csv_path)
+    market_code = code.upper() if code[:2].upper() in ("SH", "SZ", "BJ") else f"SH{code}"
+    name = ""
+    try:
+        from predict.kronos_engine import find_stock, read_h5
+        found = find_stock(market_code)
+        if found:
+            name = found[1]
+        hist = read_h5(market_code).iloc[-500:]
+        history = [
+            {"date": str(d.date()), "close": round(float(c), 3)}
+            for d, c in zip(pd.to_datetime(hist["date"]), hist["close"])
+        ]
+    except Exception:
+        history = []
+
+    prediction = []
+    for _, r in summary.iterrows():
+        prediction.append({
+            "date": str(pd.to_datetime(r["date"]).date()),
+            "p10": round(float(r["close_p10"]), 3),
+            "p25": round(float(r["close_p25"]), 3),
+            "p50": round(float(r["close_p50"]), 3),
+            "p75": round(float(r["close_p75"]), 3),
+            "p90": round(float(r["close_p90"]), 3),
+            "mean": round(float(r.get("close_mean", r["close_p50"])), 3),
+        })
+
+    last_close = float(history[-1]["close"]) if history else float(summary["close_p50"].iloc[0])
+    final_p50 = float(summary["close_p50"].iloc[-1])
+    return {
+        "code": code,
+        "name": name,
+        "last_close": round(last_close, 3),
+        "final_p50": round(final_p50, 3),
+        "final_chg": round((final_p50 / last_close - 1) * 100, 2),
+        "direction": "up" if final_p50 > last_close else "down",
+        "prob": round(float((summary["close_p50"] > last_close).mean()), 4) if len(summary) else None,
+        "hi_p90": round(float(summary["close_p90"].max()), 3),
+        "lo_p10": round(float(summary["close_p10"].min()), 3),
+        "start_date": str(pd.to_datetime(summary["date"].iloc[0]).date()),
+        "end_date": str(pd.to_datetime(summary["date"].iloc[-1]).date()),
+        "pred_len": int(len(summary)),
+        "history": history,
+        "prediction": prediction,
+        "chart_url": f"/state/predicts/pred_{code.lower()}_chart.png"
+        if os.path.exists(_predict_paths(code)[1]) else None,
+    }
+
+
+class PredictRunRequest(BaseModel):
+    query: str = "600900"
+    months: int = 6
+    samples: int = 20
+    lookback: int = 400
+    device: str = "cuda:0"
+    save_mysql: bool = True
+    chart: bool = True
+
+
+@app.post("/api/predicts/run")
+async def api_predict_run(req: PredictRunRequest):
+    """触发一次 Kronos 预测（同步执行，首次加载模型/下载权重耗时较长）"""
+    if not _predict_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有预测任务正在执行，请稍候再试")
+    try:
+        # 确保模型权重可从镜像下载（本地缓存被清空时）
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        from predict.run_predict import run_prediction
+        result = run_prediction(
+            req.query, months=req.months, samples=req.samples,
+            lookback=req.lookback, device=req.device,
+            chart=req.chart, save_mysql=req.save_mysql, verbose=False,
+        )
+        return {"success": True, "predict": result}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"预测失败: {e}")
+    finally:
+        _predict_lock.release()
+
+
+@app.delete("/api/predicts/{code}")
+async def api_predict_delete(code: str):
+    """删除指定股票的预测产物（CSV + 图表 PNG）"""
+    csv_path, chart_path = _predict_paths(code)
+    removed = []
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
+        removed.append(os.path.basename(csv_path))
+    if os.path.exists(chart_path):
+        os.remove(chart_path)
+        removed.append(os.path.basename(chart_path))
+    return {"success": True, "removed": removed}

@@ -201,6 +201,42 @@ def save_kronos_signal(stock_code: str, trade_date, signal_type: str,
         logger.warning("写入 kronos_signal 失败（已降级，不影响预测）: %s", e)
 
 
+def list_kronos_signals(limit: int = 50, stock_code: str | None = None) -> list[dict]:
+    """查询 Kronos 预测信号历史（kronos_signal 表）。
+
+    - limit: 最多返回条数
+    - stock_code: 可选，按证券代码过滤（如 sh600900）
+    返回 dict 列表；features_json 自动解析为 features 字段。
+    MySQL 不可用时抛异常（由调用方决定降级策略）。
+    """
+    import json
+
+    conn = get_connection(autocommit=True)
+    try:
+        cur = conn.cursor(dictionary=True)
+        sql = ("SELECT id, stock_code, trade_date, signal_type, probability,"
+               " features_json, model_version, created_at"
+               " FROM kronos_signal")
+        params: list = []
+        if stock_code:
+            sql += " WHERE stock_code=%s"
+            params.append(stock_code)
+        sql += " ORDER BY trade_date DESC, id DESC LIMIT %s"
+        params.append(int(limit))
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        for r in rows:
+            f = r.pop("features_json", None)
+            if f:
+                try:
+                    r["features"] = json.loads(f)
+                except Exception:
+                    r["features"] = None
+        return rows
+    finally:
+        conn.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MySQL 业务库初始化")
     parser.add_argument("--init", action="store_true", help="初始化数据库与业务表")
