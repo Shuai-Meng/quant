@@ -131,9 +131,24 @@ def task_after_market(date=None):
 def _save_signals():
     """生成交易信号并保存到文件
 
-    策略：热点强势股 + 实时涨跌幅排序，兼顾质量和动量。
-    如需多因子Alpha信号，运行 python run_signals.py 生成完整信号。
+    策略：多因子 Alpha 选股优先；若数据源不可用，回退到热点强势股 + 实时涨跌幅。
     """
+    signal_file = os.path.join(SIGNAL_DIR, "latest.json")
+
+    # 1. 多因子 Alpha 选股（技术/行为因子合成，Top 30）
+    try:
+        from signals.generate import generate_signals, save_signals
+
+        df = generate_signals(top_n=30, n_stocks=300, verbose=False)
+        if df is not None and not df.empty:
+            records = save_signals(df, out_path=signal_file)
+            log.info(f"多因子信号已保存: {len(records)} 条 (source=multi_factor)")
+            return records
+        log.warning("多因子信号为空，回退到热点信号")
+    except Exception as e:
+        log.error(f"多因子信号生成失败({e})，回退到热点信号")
+
+    # 2. 回退：热点强势股 + 实时涨跌幅
     try:
         from data.fetchers.hexin import HexinFetcher
         from data.fetchers.tencent import TencentFetcher
@@ -176,7 +191,6 @@ def _save_signals():
                             "source": "realtime_top",
                         })
 
-        signal_file = os.path.join(SIGNAL_DIR, "latest.json")
         with open(signal_file, "w") as f:
             json.dump(signal_data, f, ensure_ascii=False, indent=2)
 

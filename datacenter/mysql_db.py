@@ -87,6 +87,33 @@ DDL_STATEMENTS = [
         KEY idx_kind_created (kind, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='数据导入日志'
     """,
+    # 标的池：每只标的一行（code 唯一），group 为分组名
+    """
+    CREATE TABLE IF NOT EXISTS watchlist_item (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        code VARCHAR(12) NOT NULL COMMENT '证券代码 如 600900.SH / 510300.SH',
+        name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '标的名称',
+        type VARCHAR(16) NOT NULL DEFAULT 'STOCK' COMMENT 'STOCK/ETF',
+        group_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '分组名',
+        sort_order INT NOT NULL DEFAULT 0 COMMENT '排序权重（保持添加顺序）',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_code (code),
+        KEY idx_group (group_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标的池'
+    """,
+    # 标的池预设组：preset_name -> 代码列表
+    """
+    CREATE TABLE IF NOT EXISTS watchlist_preset (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        preset_name VARCHAR(64) NOT NULL COMMENT '预设组名',
+        code VARCHAR(12) NOT NULL COMMENT '证券代码 如 510300.SH',
+        sort_order INT NOT NULL DEFAULT 0 COMMENT '组内排序',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_preset_code (preset_name, code),
+        KEY idx_preset (preset_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标的池预设组'
+    """,
 ]
 
 
@@ -233,6 +260,107 @@ def list_kronos_signals(limit: int = 50, stock_code: str | None = None) -> list[
                 except Exception:
                     r["features"] = None
         return rows
+    finally:
+        conn.close()
+
+
+def list_watchlist_items() -> list[dict]:
+    """读取标的池全部条目（watchlist_item 表），按 sort_order 排序。
+
+    MySQL 不可用时抛异常（由调用方决定降级策略，如回退 JSON 文件）。
+    """
+    conn = get_connection(autocommit=True)
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT code, name, type, group_name FROM watchlist_item"
+            " ORDER BY sort_order ASC, id ASC",
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "code": r["code"],
+                "name": r["name"] or "",
+                "type": r["type"] or "STOCK",
+                "group": r["group_name"] or "",
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def save_watchlist_items(items: list[dict]) -> None:
+    """全量替换标的池条目（watchlist_item 表，事务）。
+
+    - items: [{code, name, type, group}, ...]，顺序即展示顺序
+    MySQL 不可用时抛异常（由调用方决定降级策略）。
+    """
+    conn = get_connection(autocommit=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM watchlist_item")
+        for idx, it in enumerate(items):
+            cur.execute(
+                "INSERT INTO watchlist_item (code, name, type, group_name, sort_order)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (
+                    str(it.get("code", "")),
+                    str(it.get("name", "") or ""),
+                    str(it.get("type", "STOCK") or "STOCK"),
+                    str(it.get("group", "") or ""),
+                    idx,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_watchlist_presets() -> dict[str, list[str]]:
+    """读取标的池预设组（watchlist_preset 表），返回 {组名: [代码...]}。
+
+    MySQL 不可用时抛异常（由调用方决定降级策略）。
+    """
+    conn = get_connection(autocommit=True)
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT preset_name, code FROM watchlist_preset"
+            " ORDER BY preset_name ASC, sort_order ASC, id ASC",
+        )
+        presets: dict[str, list[str]] = {}
+        for r in cur.fetchall():
+            presets.setdefault(r["preset_name"], []).append(r["code"])
+        return presets
+    finally:
+        conn.close()
+
+
+def save_watchlist_presets(presets: dict[str, list[str]]) -> None:
+    """全量替换标的池预设组（watchlist_preset 表，事务）。
+
+    - presets: {组名: [代码...], ...}，列表顺序即组内顺序
+    MySQL 不可用时抛异常（由调用方决定降级策略）。
+    """
+    conn = get_connection(autocommit=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM watchlist_preset")
+        for name, codes in (presets or {}).items():
+            for idx, code in enumerate(codes):
+                cur.execute(
+                    "INSERT INTO watchlist_preset (preset_name, code, sort_order)"
+                    " VALUES (%s, %s, %s)",
+                    (str(name), str(code), idx),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

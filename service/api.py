@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+import logging
 import subprocess
 import threading
 from datetime import datetime, date
@@ -24,7 +25,53 @@ from service.market_hours import market_status, is_trade_day, is_market_open, no
 from service.portfolio import PortfolioTracker
 from service.monitor import LiveMonitor
 
+logger = logging.getLogger("service.api")
 app = FastAPI(title="Quant Service API", version="0.1.0")
+
+# ---- 公网暴露防护：Basic Auth + 只读模式（环境变量控制）----
+# BASIC_AUTH_USER / BASIC_AUTH_PASS 同时设置时启用鉴权（未设置则不鉴权，便于本地调试）
+# READ_ONLY=1 时禁止一切写操作（交易/回测/策略/预测/标的池修改等）
+import base64
+import secrets as _secrets
+
+_BASIC_USER = os.environ.get("BASIC_AUTH_USER", "")
+_BASIC_PASS = os.environ.get("BASIC_AUTH_PASS", "")
+_READ_ONLY = os.environ.get("READ_ONLY", "") == "1"
+_AUTH_ENABLED = bool(_BASIC_USER and _BASIC_PASS)
+
+# 只读模式下拦截的路径前缀（写接口）
+_WRITE_PREFIXES = ("/api/trade", "/api/backtest", "/api/strategies",
+                   "/api/predicts/run", "/api/watchlist")
+
+
+def _check_basic_auth(authorization: str) -> bool:
+    if not authorization.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(authorization[6:]).decode("utf-8")
+        user, _, passwd = decoded.partition(":")
+    except Exception:
+        return False
+    return _secrets.compare_digest(user, _BASIC_USER) and _secrets.compare_digest(passwd, _BASIC_PASS)
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    if _AUTH_ENABLED:
+        auth = request.headers.get("Authorization", "")
+        if not _check_basic_auth(auth):
+            return JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Quant"'},
+            )
+    if _READ_ONLY and request.method != "GET":
+        for prefix in _WRITE_PREFIXES:
+            if request.url.path.startswith(prefix):
+                return JSONResponse(
+                    {"detail": "read-only mode: 写操作已禁用"}, status_code=403
+                )
+    return await call_next(request)
 
 # 静态文件服务 (web界面)
 _WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -101,12 +148,17 @@ async def api_signals(
     信号文件: state/signals/latest.json
     """
     signal_file = os.path.join(get_state_path("signals"), "latest.json")
+    # 只读模式下禁止强制刷新（避免被公网滥用触发子进程）
+    refresh = refresh and not _READ_ONLY
     if refresh or not os.path.exists(signal_file):
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "signals.generate"],
-                capture_output=True, text=True, timeout=120,
+                [sys.executable, "-m", "signals.generate",
+                 "--top", "30", "--stocks", "300"],
+                capture_output=True, text=True, timeout=300,
             )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr[-500:] or f"exit {result.returncode}")
         except Exception as e:
             raise HTTPException(500, f"信号生成失败: {e}")
 
@@ -275,14 +327,50 @@ _WATCHLIST_FILE = os.path.join(
 )
 
 
+def _normalize_code(code: str) -> str:
+    """将裸代码补全市场后缀，如 600900 -> 600900.SH、159915 -> 159915.SZ"""
+    code = (code or "").strip().upper()
+    if not code or "." in code or not code.isdigit():
+        return code
+    first = code[0]
+    if first in "569":
+        return f"{code}.SH"   # 沪市A股(6)/B股(9)/基金(5)
+    if first in "0123":
+        return f"{code}.SZ"   # 深市A股(0)/基金(1)/B股(2)/创业板(3)
+    if first in "48":
+        return f"{code}.BJ"   # 北交所
+    return code
+
+
 def _load_watchlist():
-    if not os.path.exists(_WATCHLIST_FILE):
-        return {"items": [], "presets": {}}
-    with open(_WATCHLIST_FILE) as f:
-        return json.load(f)
+    """读取标的池：MySQL 优先，失败自动降级回 JSON 文件。"""
+    data = None
+    try:
+        from datacenter.mysql_db import list_watchlist_items, list_watchlist_presets
+        data = {"items": list_watchlist_items(), "presets": list_watchlist_presets()}
+    except Exception:
+        logger.warning("标的池 MySQL 读取失败，降级 JSON 文件", exc_info=True)
+    if data is None:
+        # 降级：JSON 文件
+        if not os.path.exists(_WATCHLIST_FILE):
+            return {"items": [], "presets": {}}
+        with open(_WATCHLIST_FILE) as f:
+            data = json.load(f)
+    # 统一代码格式（兼容历史数据中的裸代码，如 600900 -> 600900.SH）
+    for item in data.get("items", []):
+        item["code"] = _normalize_code(item["code"])
+    return data
 
 
 def _save_watchlist(data):
+    """保存标的池：MySQL 优先，失败自动降级回 JSON 文件。"""
+    try:
+        from datacenter.mysql_db import save_watchlist_items, save_watchlist_presets
+        save_watchlist_items(data.get("items", []))
+        save_watchlist_presets(data.get("presets", {}))
+        return
+    except Exception:
+        logger.warning("标的池 MySQL 写入失败，降级 JSON 文件", exc_info=True)
     os.makedirs(os.path.dirname(_WATCHLIST_FILE), exist_ok=True)
     with open(_WATCHLIST_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -308,7 +396,7 @@ async def api_watchlist_add(req: dict):
     data = _load_watchlist()
 
     if action == "add":
-        code = req.get("code", "").strip().upper()
+        code = _normalize_code(req.get("code", "").strip().upper())
         if not code:
             raise HTTPException(400, "code required")
         existing = [i for i in data["items"] if i["code"] == code]
@@ -322,11 +410,11 @@ async def api_watchlist_add(req: dict):
         })
 
     elif action == "remove":
-        code = req.get("code", "").strip().upper()
+        code = _normalize_code(req.get("code", "").strip().upper())
         data["items"] = [i for i in data["items"] if i["code"] != code]
 
     elif action == "update":
-        code = req.get("code", "").strip().upper()
+        code = _normalize_code(req.get("code", "").strip().upper())
         for item in data["items"]:
             if item["code"] == code:
                 for field in ("name", "type", "group"):

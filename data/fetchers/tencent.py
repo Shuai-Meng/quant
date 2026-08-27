@@ -15,13 +15,13 @@ from .base import DataFetcher, retry
 def _code_to_tencent(code):
     """将股票代码转为腾讯格式"""
     code = str(code).strip()
-    if code.startswith("6") or code.startswith("9"):
+    if code.startswith("6") or code.startswith("9") or code.startswith("5"):
+        # 沪市A股(6)/B股(9)/基金(5，如510300、588000、560010)
         return f"sh{code}"
-    elif code.startswith("0") or code.startswith("3"):
+    elif code.startswith("0") or code.startswith("1") or code.startswith("2") or code.startswith("3"):
+        # 深市A股(0)/基金(1，如159915)/B股(2)/创业板(3)
         return f"sz{code}"
-    elif code.startswith("4"):
-        return f"bj{code}"
-    elif code.startswith("8"):
+    elif code.startswith("4") or code.startswith("8"):
         return f"bj{code}"
     return code
 
@@ -74,11 +74,13 @@ class TencentFetcher(DataFetcher):
         for line in raw.strip().split(";"):
             if "=" not in line or '"' not in line:
                 continue
-            vals = line.split('"')[1].split("~")
+            key, val = line.split("=", 1)
+            # 响应键名 v_sh510300 -> sh510300（vals[0] 是市场标志，非代码）
+            t_code = key.split("_", 1)[-1] if "_" in key else key
+            vals = val.split('"')[1].split("~")
             if len(vals) < 50:
                 continue
 
-            t_code = vals[0]
             rows.append(
                 {
                     "code": _code_from_tencent(t_code),
